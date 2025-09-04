@@ -1,57 +1,43 @@
-# app.py
-# Streamlit Trading Assistant (Quotes + Orders) with Live Visuals
-# ---------------------------------------------------------------
-# To run locally:
-#   pip install -r requirements.txt
-#   streamlit run app.py
+# app.py — Simple Streamlit Trading Assistant (Quotes + Orders)
+# ------------------------------------------------------------
+# Run:  streamlit run app.py
 #
-# Expected secrets in .streamlit/secrets.toml or Streamlit Cloud:
+# Secrets (works with either nested or top-level):
+# .streamlit/secrets.toml
+#
 # [api]
 # PUBLIC_API_SECRET = "..."
 # OPENAI_API_KEY    = "..."
-# API_BASE          = "https://api.public.com"   # optional, defaults below
-# ACCOUNT_ID        = "..."                      # optional; if omitted, fetched via API
+# API_BASE          = "https://api.public.com"   # optional
+# ACCOUNT_ID        = "..."                      # optional
 #
-# [ui]
-# REFRESH_MS = 4000                              # optional, live refresh interval for quotes
-# MODEL      = "gpt-4o-mini"                     # optional
+# # or top-level:
+# PUBLIC_API_SECRET = "..."
+# OPENAI_API_KEY    = "..."
+# API_BASE          = "https://api.public.com"
+# ACCOUNT_ID        = "..."
 
-import time, uuid, requests, re, json
-from typing import Optional, Dict, Any, List
 import streamlit as st
-from datetime import datetime
+import requests, uuid, re, json, time
+from typing import Optional, Dict, Any, List
 from openai import OpenAI
 
-# ---- Config / Secrets ----
-API = st.secrets.get("api", {}).get("API_BASE", "https://api.public.com")
-PUBLIC_API_SECRET = st.secrets.get("api", {}).get("PUBLIC_API_SECRET", "")
-OPENAI_API_KEY    = st.secrets.get("api", {}).get("OPENAI_API_KEY", "")
-ACCOUNT_ID        = st.secrets.get("api", {}).get("ACCOUNT_ID")  # optional
+# ---------- Config / Secrets (supports [api] or top-level) ----------
+_api = st.secrets.get("api", {})
+PUBLIC_API_SECRET = _api.get("PUBLIC_API_SECRET", st.secrets.get("PUBLIC_API_SECRET", ""))
+OPENAI_API_KEY    = _api.get("OPENAI_API_KEY",    st.secrets.get("OPENAI_API_KEY", ""))
+API               = _api.get("API_BASE",          st.secrets.get("API_BASE", "https://api.public.com"))
+ACCOUNT_ID        = _api.get("ACCOUNT_ID",        st.secrets.get("ACCOUNT_ID", None))
+MODEL             = "gpt-4o-mini"
 
-MODEL = st.secrets.get("ui", {}).get("MODEL", "gpt-4o-mini")
-REFRESH_MS = int(st.secrets.get("ui", {}).get("REFRESH_MS", 4000))
+st.set_page_config(page_title="Trading Assistant", page_icon="📈", layout="wide")
+st.title("📈 Simple Trading Assistant")
+st.caption("Quotes and natural-language orders. Minimal UI, close to your original code.")
 
-st.set_page_config(
-    page_title="Trading Assistant",
-    page_icon="📈",
-    layout="wide",
-)
-
-# ---- Styles (subtle polish) ----
-st.markdown("""
-<style>
-/* Card look for blocks */
-.block { background: #0e1117; border: 1px solid #262730; border-radius: 14px; padding: 16px; }
-.small { font-size: 0.90rem; color: #a0a0a0; }
-/* Center metrics a bit nicer on wide screens */
-[data-testid="stMetricValue"] { font-weight: 700; }
-</style>
-""", unsafe_allow_html=True)
-
-# ---- OpenAI client ----
+# ---------- Clients ----------
 oclient = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# ---- Public API helpers ----
+# ---------- API helpers (same behavior as your original) ----------
 def get_access_token(secret: str, minutes: int = 15) -> str:
     r = requests.post(
         f"{API}/userapiauthservice/personal/access-tokens",
@@ -88,14 +74,20 @@ def list_instruments(token: str, page_size: int = 500) -> List[dict]:
     return out
 
 def resolve_symbol(token: str, symbol_or_name: str) -> Optional[str]:
-    s = symbol_or_name.strip()
+    """Simple resolution: accept exact ticker in ALL CAPS; else best-effort by name."""
+    s = (symbol_or_name or "").strip()
+    if not s:
+        return None
     if re.fullmatch(r"[A-Za-z\.-]{1,8}", s) and s.upper() == s:
         return s.upper()
     for it in list_instruments(token):
-        if it.get("type") != "EQUITY": continue
-        if it.get("symbol","").upper() == s.upper(): return it["symbol"]
+        if it.get("type") != "EQUITY": 
+            continue
+        if it.get("symbol","").upper() == s.upper(): 
+            return it["symbol"]
         name = (it.get("name") or "").lower()
-        if s.lower() in name: return it["symbol"]
+        if s.lower() in name: 
+            return it["symbol"]
     return None
 
 def get_equity_quote(token: str, account_id: str, symbol: str) -> Optional[dict]:
@@ -138,7 +130,7 @@ def get_order(token: str, account_id: str, order_id: str) -> Optional[dict]:
     r.raise_for_status()
     return r.json()
 
-# ---- LLM Prompts ----
+# ---------- LLM helpers (same logic, minimal) ----------
 SYSTEM = """You are a trading assistant that interprets user messages into either a QUOTE query or an ORDER intent for equities.
 Return STRICT JSON with this shape:
 
@@ -161,14 +153,13 @@ Return STRICT JSON with this shape:
 
 Rules:
 - If user asks for price (e.g., "price of X", "quote X"), set type="QUOTE" and ignore intent.
-- For orders, quantity OR amount is required; at least one must be present.
-- LIMIT or STOP_LIMIT require limitPrice; STOP or STOP_LIMIT require stopPrice.
-- If anything mandatory is missing, set type="ASK", include a single best "question" to ask next, list "missing".
-- Keep "summary" one sentence, user-friendly.
-- Do not include any extra keys or commentary. JSON only.
+- For orders, quantity OR amount is required.
+- LIMIT/STOP_LIMIT require limitPrice; STOP/STOP_LIMIT require stopPrice.
+- If mandatory fields are missing, set type="ASK", add a single best 'question', and list 'missing'.
+- JSON only; no commentary.
 """
 
-def llm_interpret(dialog: List[Dict[str, str]]) -> Dict[str, Any]:
+def llm_interpret(dialog: list[Dict[str, str]]) -> Dict[str, Any]:
     if not oclient:
         return {"type": "ASK", "question": "OpenAI key missing.", "missing": ["OPENAI_API_KEY"], "intent": None, "summary": None}
     resp = oclient.chat.completions.create(
@@ -190,43 +181,18 @@ def llm_phrase(text: str) -> str:
     )
     return resp.choices[0].message.content.strip()
 
-def phrase_preflight(symbol: str, pre: dict) -> str:
-    est = pre if isinstance(pre, dict) else {}
-    parts = []
-    if "estimatedCost" in est and est["estimatedCost"] is not None:
-        parts.append(f"Estimated cost: {est['estimatedCost']}.")
-    if "buyingPowerImpact" in est and est["buyingPowerImpact"] is not None:
-        parts.append(f"Buying power impact: {est['buyingPowerImpact']}.")
-    if est.get("warnings"):
-        parts.append("Warnings: " + "; ".join([str(w) for w in est["warnings"]]))
-    msg = f"Preflight for {symbol}: " + (" ".join(parts) or "no details returned.")
-    return llm_phrase(msg)
-
-def phrase_final(status: Optional[dict], order_id: str) -> str:
-    if not status:
-        return llm_phrase(f"Order {order_id} was submitted. Current status isn’t available yet.")
-    stt = status.get("status")
-    rr = status.get("rejectReason")
-    execs = status.get("executions") or []
-    base = f"Order {order_id} status: {stt or 'UNKNOWN'}."
-    if rr: base += f" Reject reason: {rr}."
-    if execs:
-        fills = "; ".join([f"{e.get('quantity')} @ {e.get('price')} ({e.get('timestamp')})" for e in execs])
-        base += f" Executions: {fills}."
-    return llm_phrase(base)
-
-# ---- Session State ----
+# ---------- Session state ----------
 if "token" not in st.session_state: st.session_state.token = None
 if "account_id" not in st.session_state: st.session_state.account_id = ACCOUNT_ID
-if "quote_history" not in st.session_state: st.session_state.quote_history = {}  # {SYM: [(ts, price), ...]}
-if "last_order_id" not in st.session_state: st.session_state.last_order_id = None
 if "dialog" not in st.session_state: st.session_state.dialog = []
+if "last_order_id" not in st.session_state: st.session_state.last_order_id = None
 
-# ---- Auth Helper ----
+# ---------- Helpers ----------
 def ensure_auth() -> Optional[str]:
-    if st.session_state.token: return st.session_state.token
+    if st.session_state.token:
+        return st.session_state.token
     if not PUBLIC_API_SECRET:
-        st.error("Missing PUBLIC_API_SECRET in secrets. Add it under [api].")
+        st.error("Missing PUBLIC_API_SECRET in secrets (either top-level or under [api]).")
         return None
     try:
         st.session_state.token = get_access_token(PUBLIC_API_SECRET)
@@ -239,7 +205,8 @@ def ensure_account_id() -> Optional[str]:
     if st.session_state.account_id:
         return st.session_state.account_id
     token = ensure_auth()
-    if not token: return None
+    if not token:
+        return None
     try:
         st.session_state.account_id = get_brokerage_account_id(token)
         return st.session_state.account_id
@@ -247,130 +214,57 @@ def ensure_account_id() -> Optional[str]:
         st.error(f"Failed to fetch brokerage account id: {e}")
         return None
 
-# ---- Header ----
-st.title("📈 Trading Assistant")
-st.caption("Quotes • Natural-language trading • Preflight • Order tracking")
+# ---------- Layout: two simple columns ----------
+col_left, col_right = st.columns(2)
 
-# ---- Sidebar: Connection / Controls ----
-with st.sidebar:
-    st.subheader("Connection")
-    ok_openai = "✅" if OPENAI_API_KEY else "⚠️"
-    ok_api = "✅" if PUBLIC_API_SECRET else "❌"
-    st.text(f"OpenAI key: {ok_openai}")
-    st.text(f"Public API secret: {ok_api}")
-
-    if st.button("Authenticate / Refresh Token", use_container_width=True):
-        st.session_state.token = None
+# ===== Quotes =====
+with col_left:
+    st.subheader("🔎 Quote")
+    q = st.text_input("Symbol or Company", placeholder="e.g., NVDA or Nvidia")
+    if st.button("Get Quote"):
         token = ensure_auth()
-        if token:
-            st.success("Authenticated")
-    if st.button("Resolve Brokerage Account", use_container_width=True):
-        acct = ensure_account_id()
-        if acct:
-            st.success(f"Account: {acct}")
-
-    st.divider()
-    st.subheader("Live Refresh")
-    st.write("Auto-refresh will keep the Quotes tab live.")
-    st.write(f"Interval: {REFRESH_MS} ms")
-
-# ---- Tabs ----
-tab_quotes, tab_trade, tab_orders, tab_settings = st.tabs(
-    ["📊 Quotes", "📝 Trade (Natural-language)", "📬 Orders", "⚙️ Settings"]
-)
-
-# ===================== Quotes Tab =====================
-with tab_quotes:
-    st.markdown("### Real-time Quotes")
-    colq1, colq2 = st.columns([2, 1])
-    with colq1:
-        q_input = st.text_input("Symbol or Company", placeholder="e.g., NVDA or Nvidia", key="q_input")
-    with colq2:
-        live = st.toggle("Live auto-refresh", value=True)
-
-    token = ensure_auth()
-    account_id = ensure_account_id()
-
-    # Auto-refresh if live
-    if live:
-        st.autorefresh(interval=REFRESH_MS, key="autorefresh_quotes")
-
-    if st.button("Get Quote", type="primary"):
-        if not (token and account_id and q_input):
-            st.warning("Enter a symbol or company and ensure you’re authenticated.")
-        else:
-            sym = resolve_symbol(token, q_input)
+        account_id = ensure_account_id()
+        if token and account_id and q:
+            sym = resolve_symbol(token, q)
             if not sym:
-                st.error(f"Could not resolve '{q_input}' to a tradable symbol.")
+                st.warning(f"Could not resolve “{q}” to a tradable symbol.")
             else:
                 try:
-                    quote = get_equity_quote(token, account_id, sym)
-                    if not quote:
+                    qt = get_equity_quote(token, account_id, sym)
+                    if not qt:
                         st.info(f"No quote returned for {sym}.")
                     else:
-                        last = quote.get("last") or quote.get("lastPrice") or quote.get("price") or quote.get("closePrice")
-                        bid, ask = quote.get("bid"), quote.get("ask")
-                        vol = quote.get("volume")
-                        ts = datetime.utcnow().isoformat()
-
-                        # update rolling per-session history
-                        hist = st.session_state.quote_history.setdefault(sym, [])
-                        if isinstance(last, (int, float)):
-                            hist.append((ts, float(last)))
-                            st.session_state.quote_history[sym] = hist[-300:]  # keep last 300 prints
-
-                        c1, c2, c3 = st.columns(3)
-                        c1.metric(f"{sym} Last", f"{last}")
-                        c2.metric("Bid / Ask", f"{bid} / {ask}")
-                        c3.metric("Volume", f"{vol}")
-
-                        # Sparkline of session prices
-                        import pandas as pd
-                        import plotly.express as px
-                        if hist:
-                            df = pd.DataFrame(hist, columns=["ts", "price"])
-                            fig = px.line(df, x="ts", y="price", title=f"{sym} (session sparkline)")
-                            fig.update_layout(margin=dict(l=0, r=0, t=40, b=0), height=260)
-                            st.plotly_chart(fig, use_container_width=True)
-
+                        last = qt.get("last") or qt.get("lastPrice") or qt.get("price") or qt.get("closePrice")
+                        bid, ask = qt.get("bid"), qt.get("ask")
+                        vol = qt.get("volume")
+                        st.success(llm_phrase(f"{sym} is around {last}. Bid {bid}, ask {ask}. Volume {vol}."))
                         with st.expander("Raw quote JSON"):
-                            st.json(quote)
+                            st.json(qt)
                 except Exception as e:
                     st.error(f"Quote lookup failed: {e}")
-
-# ===================== Trade Tab =====================
-with tab_trade:
-    st.markdown("### Natural-language Trading")
-    st.caption("Describe what you want to do (e.g., “Buy 10 shares of Nvidia at a limit of 120 GTC”).")
-
-    nl = st.text_area("Your instruction", height=100, placeholder="e.g., 'Buy $500 of AAPL as a market order, DAY.'")
-    colA, colB = st.columns([1,1])
-    with colA:
-        parse_btn = st.button("Parse Intent", type="primary")
-    with colB:
-        clear_btn = st.button("Clear")
-
-    if clear_btn:
-        st.session_state.dialog = []
-
-    if parse_btn:
-        if not nl.strip():
-            st.warning("Enter an instruction first.")
-        elif not oclient:
-            st.error("OpenAI API key missing. Add it to secrets.")
         else:
-            st.session_state.dialog.append({"role": "user", "content": nl})
-            parsed = llm_interpret(st.session_state.dialog)
+            st.warning("Enter a symbol/company and check secrets.")
 
-            st.markdown("#### Interpretation")
+# ===== Trade (NL) =====
+with col_right:
+    st.subheader("📝 Trade (Natural-language)")
+    ins = st.text_area("Instruction", placeholder="e.g., Buy 10 AAPL @ 190 limit, GTC", height=110)
+    parse = st.button("Parse & Preflight")
+    if parse:
+        if not ins.strip():
+            st.warning("Enter an instruction.")
+        else:
+            st.session_state.dialog.append({"role":"user","content":ins})
+            parsed = llm_interpret(st.session_state.dialog)
+            st.write("Interpretation:")
             st.json(parsed)
 
             ptype = parsed.get("type")
             if ptype == "QUOTE":
-                # Ask LLM for the target security string
                 if not oclient:
                     st.info("OpenAI key missing for symbol extraction.")
                 else:
+                    # simple symbol extraction
                     ask_symbol = oclient.chat.completions.create(
                         model=MODEL,
                         response_format={"type":"json_object"},
@@ -381,41 +275,38 @@ with tab_trade:
                         temperature=0.0,
                     )
                     qstr = json.loads(ask_symbol.choices[0].message.content).get("query")
-                    if not qstr:
-                        st.warning("Please specify a symbol or company.")
-                    else:
-                        token = ensure_auth(); account_id = ensure_account_id()
-                        if token and account_id:
-                            sym = resolve_symbol(token, qstr)
-                            if not sym:
-                                st.error(f"Could not find a tradable symbol for “{qstr}”. Try the exact ticker.")
+                    token = ensure_auth(); account_id = ensure_account_id()
+                    if token and account_id and qstr:
+                        sym = resolve_symbol(token, qstr)
+                        if not sym:
+                            st.warning(f"Could not resolve “{qstr}”. Try the exact ticker.")
+                        else:
+                            qt = get_equity_quote(token, account_id, sym)
+                            if qt:
+                                last = qt.get("last") or qt.get("lastPrice") or qt.get("price") or qt.get("closePrice")
+                                bid, ask = qt.get("bid"), qt.get("ask")
+                                vol = qt.get("volume")
+                                st.success(llm_phrase(f"{sym} is around {last}. Bid {bid}, ask {ask}. Volume {vol}."))
                             else:
-                                quote = get_equity_quote(token, account_id, sym)
-                                if not quote:
-                                    st.info(f"No quote for {sym}.")
-                                else:
-                                    last = quote.get("last") or quote.get("lastPrice") or quote.get("price") or quote.get("closePrice")
-                                    bid, ask = quote.get("bid"), quote.get("ask")
-                                    vol = quote.get("volume")
-                                    st.success(llm_phrase(f"{sym} is around {last}. Bid {bid}, ask {ask}. Volume {vol}."))
-
+                                st.info(f"No quote for {sym}.")
+                    else:
+                        st.warning("Missing auth or symbol.")
             elif ptype == "ASK":
                 st.info(parsed.get("question") or "Need more details.")
             else:
-                # ORDER flow
+                # ORDER path
                 intent = parsed.get("intent") or {}
                 missing = parsed.get("missing") or []
                 if missing:
-                    st.warning(f"Missing: {', '.join(missing)}")
+                    st.warning("Missing: " + ", ".join(missing))
                 else:
                     token = ensure_auth(); account_id = ensure_account_id()
                     if not (token and account_id):
                         st.stop()
-
                     symbol_input = intent.get("symbol")
                     sym = resolve_symbol(token, symbol_input) if symbol_input else None
                     if not sym:
-                        st.error(f"Couldn’t resolve a ticker for “{symbol_input}”. Provide the symbol (e.g., NVDA).")
+                        st.warning(f"Couldn’t resolve a ticker for “{symbol_input}”. Provide the symbol (e.g., NVDA).")
                     else:
                         side = intent.get("side")
                         otype = intent.get("orderType")
@@ -438,24 +329,30 @@ with tab_trade:
                         if lpx is not None: body["limitPrice"] = str(lpx)
                         if spx is not None: body["stopPrice"] = str(spx)
 
-                        human_summary = parsed.get("summary") or f"{side} {qty or ('$'+str(amt))} of {sym} as {otype} ({tif})" + (f" @ {lpx}" if lpx else "") + (f" stop {spx}" if spx else "")
-                        st.markdown(f"##### Review")
-                        st.info(llm_phrase("Please review: " + human_summary))
+                        human = parsed.get("summary") or f"{side} {qty or ('$'+str(amt))} of {sym} as {otype} ({tif})" + (f" @ {lpx}" if lpx else "") + (f" stop {spx}" if spx else "")
+                        st.info("Review: " + llm_phrase(human))
 
                         # Preflight
-                        with st.spinner("Preflighting..."):
-                            try:
-                                pre = preflight_single_leg(token, account_id, body)
-                                st.success(phrase_preflight(sym, pre))
-                                with st.expander("Preflight JSON"):
-                                    st.json(pre)
-                            except requests.HTTPError as e:
-                                st.error("Preflight failed.")
-                                st.code(e.response.text)
-                                st.stop()
+                        try:
+                            pre = preflight_single_leg(token, account_id, body)
+                            # Simple human summary
+                            parts = []
+                            if pre.get("estimatedCost") is not None:
+                                parts.append(f"Estimated cost: {pre['estimatedCost']}.")
+                            if pre.get("buyingPowerImpact") is not None:
+                                parts.append(f"Buying power impact: {pre['buyingPowerImpact']}.")
+                            if pre.get("warnings"):
+                                parts.append("Warnings: " + "; ".join(map(str, pre["warnings"])))
+                            st.success("Preflight OK. " + ( " ".join(parts) or "" ))
+                            with st.expander("Preflight JSON"):
+                                st.json(pre)
+                        except requests.HTTPError as e:
+                            st.error("Preflight failed.")
+                            st.code(e.response.text)
+                            st.stop()
 
-                        # Place order
-                        if st.button(f"🚀 Place Order {order_id}", type="primary"):
+                        # Place
+                        if st.button(f"Place Order {order_id}"):
                             try:
                                 _ = place_order(token, account_id, body)
                                 st.session_state.last_order_id = order_id
@@ -464,56 +361,12 @@ with tab_trade:
                                 st.error("Order placement failed.")
                                 st.code(e.response.text)
 
-# ===================== Orders Tab =====================
-with tab_orders:
-    st.markdown("### Track Orders")
-    token = ensure_auth(); account_id = ensure_account_id()
-
-    default_oid = st.session_state.last_order_id or ""
-    order_id_input = st.text_input("Order ID", value=default_oid, placeholder="UUID from placement response")
-
-    col1, col2 = st.columns([1,1])
-    live_track = col1.toggle("Live status (auto-refresh)", value=True, key="orders_live")
-    if live_track:
-        st.autorefresh(interval=REFRESH_MS, key="autorefresh_orders")
-
-    if col2.button("Fetch Status", type="primary"):
-        if not (token and account_id and order_id_input):
-            st.warning("Enter an order ID and ensure you’re authenticated.")
-        else:
-            try:
-                status = get_order(token, account_id, order_id_input)
-                if not status:
-                    st.info("No status available yet.")
-                else:
-                    st.markdown("#### Current Status")
-                    s = status.get("status", "UNKNOWN")
-                    color = "green" if s == "FILLED" else ("red" if s in {"REJECTED","CANCELLED","EXPIRED"} else "orange")
-                    st.markdown(f"<div class='block'><span class='small'>Order</span><h3 style='margin:4px 0'>{order_id_input}</h3><b style='color:{color}'>{s}</b></div>", unsafe_allow_html=True)
-                    st.write(phrase_final(status, order_id_input))
-                    with st.expander("Status JSON"):
-                        st.json(status)
-            except Exception as e:
-                st.error(f"Status fetch failed: {e}")
-
-# ===================== Settings Tab =====================
-with tab_settings:
-    st.markdown("### Settings & Diagnostics")
-    st.write("Secrets loaded (keys only, no values):")
-    visible = {
-        "api_keys_present": {
-            "PUBLIC_API_SECRET": bool(PUBLIC_API_SECRET),
-            "OPENAI_API_KEY": bool(OPENAI_API_KEY),
-        },
-        "api_base": API,
-        "account_id": st.session_state.account_id or "(not set)",
-        "model": MODEL,
-        "refresh_ms": REFRESH_MS,
-    }
-    st.json(visible)
-
-    st.divider()
-    st.markdown("#### Troubleshooting")
-    st.write("- If quotes don’t update, re-auth in the sidebar.")
-    st.write("- If symbol resolution fails, try the exact ticker (e.g., AAPL).")
-    st.write("- For orders, ensure required fields: **quantity or amount**, plus **limit/stop** where applicable.")
+# ----- Simple diagnostics -----
+st.divider()
+st.caption("Diagnostics")
+st.write({
+    "PUBLIC_API_SECRET?": bool(PUBLIC_API_SECRET),
+    "OPENAI_API_KEY?": bool(OPENAI_API_KEY),
+    "API": API,
+    "ACCOUNT_ID (current)": st.session_state.account_id or "(not set)",
+})
