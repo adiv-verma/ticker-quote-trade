@@ -293,7 +293,6 @@ with tab_quotes:
 
     # Auto-refresh if live
     if live:
-        st.experimental_rerun  # no-op reference to keep pylance happy
         st.autorefresh(interval=REFRESH_MS, key="autorefresh_quotes")
 
     if st.button("Get Quote", type="primary"):
