@@ -1,23 +1,43 @@
 import streamlit as st
 import requests, uuid, re, json, time
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from openai import OpenAI
 
-# -------------------- Secrets (supports [api] or top-level) --------------------
-_api = st.secrets.get("api", {})
+# -------------------- Secrets (supports [api]/[auth] or top-level) --------------------
+_api  = st.secrets.get("api", {})
+_auth = st.secrets.get("auth", {})
+
 PUBLIC_API_SECRET = _api.get("PUBLIC_API_SECRET", st.secrets.get("PUBLIC_API_SECRET", ""))
 OPENAI_API_KEY    = _api.get("OPENAI_API_KEY",    st.secrets.get("OPENAI_API_KEY", ""))
 API               = _api.get("API_BASE",          st.secrets.get("API_BASE", "https://api.public.com"))
 ACCOUNT_ID        = _api.get("ACCOUNT_ID",        st.secrets.get("ACCOUNT_ID", None))
+
+APP_PASSWORD      = _auth.get("APP_PASSWORD",     st.secrets.get("APP_PASSWORD", ""))  # <- set this in secrets
 MODEL             = "gpt-4o-mini"
 
 st.set_page_config(page_title="Trading Chatbot", page_icon="💬", layout="centered")
 st.title("💬 Trading Chatbot")
 
+# -------------------- Password Gate --------------------
+if "authed" not in st.session_state:
+    st.session_state.authed = False
+
+if not st.session_state.authed:
+    with st.form("login", clear_on_submit=False):
+        pw = st.text_input("Enter password", type="password")
+        submitted = st.form_submit_button("Unlock")
+    if submitted:
+        if APP_PASSWORD and pw == APP_PASSWORD:
+            st.session_state.authed = True
+            st.experimental_rerun() if hasattr(st, "experimental_rerun") else st.rerun()
+        else:
+            st.error("Incorrect password.")
+    st.stop()
+
 # -------------------- Clients --------------------
 oclient = OpenAI(api_key=OPENAI_API_KEY)
 
-# -------------------- Public API helpers (same spirit as your code) --------------------
+# -------------------- Public API helpers --------------------
 def get_access_token(secret: str, minutes: int = 15) -> str:
     r = requests.post(
         f"{API}/userapiauthservice/personal/access-tokens",
@@ -57,10 +77,8 @@ def resolve_symbol(token: str, symbol_or_name: str) -> Optional[str]:
     s = (symbol_or_name or "").strip()
     if not s:
         return None
-    # exact ticker in CAPS (NVDA, BRK.B, etc.)
     if re.fullmatch(r"[A-Za-z\.-]{1,8}", s) and s.upper() == s:
         return s.upper()
-    # fallback: scan instruments by name (simple best-effort)
     for it in list_instruments(token):
         if it.get("type") != "EQUITY":
             continue
@@ -102,9 +120,8 @@ def get_order(token: str, account_id: str, order_id: str) -> Optional[dict]:
     r.raise_for_status()
     return r.json()
 
-# -------------------- LLM prompts (no JSON is shown to the user) --------------------
+# -------------------- LLM helpers --------------------
 SYSTEM = """You are a trading assistant that interprets user messages into either a QUOTE query or an ORDER intent for equities.
-
 Return STRICT JSON with this shape:
 
 {
@@ -121,15 +138,15 @@ Return STRICT JSON with this shape:
     "stopPrice": number | null,
     "tif": "DAY" | "GTC" | null
   },
-  "summary": string | null
+    "summary": string | null
 }
 
 Rules:
 - If user asks for price (e.g., "price of X", "quote X"), set type="QUOTE".
-- For orders, quantity OR amount is required; do NOT assume an order type if not specified.
+- For orders, quantity OR amount is required; do NOT assume any default if missing.
 - LIMIT/STOP_LIMIT require limitPrice; STOP/STOP_LIMIT require stopPrice.
-- If anything mandatory is missing, set type="ASK" with a single best follow-up "question" and list "missing".
-- JSON only. No chatter.
+- If anything mandatory is missing, set type="ASK" with one best follow-up "question" and list "missing".
+- JSON only.
 """
 
 def llm_interpret(dialog: List[Dict[str, str]]) -> Dict[str, Any]:
@@ -140,17 +157,6 @@ def llm_interpret(dialog: List[Dict[str, str]]) -> Dict[str, Any]:
         temperature=0.1,
     )
     return json.loads(resp.choices[0].message.content)
-
-def llm_phrase(text: str) -> str:
-    resp = oclient.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role":"system","content":"Rewrite briefly and clearly for an end user."},
-            {"role":"user","content":text}
-        ],
-        temperature=0.2,
-    )
-    return resp.choices[0].message.content.strip()
 
 def llm_extract_target(dialog: List[Dict[str, str]]) -> Optional[str]:
     resp = oclient.chat.completions.create(
@@ -170,25 +176,25 @@ def llm_extract_target(dialog: List[Dict[str, str]]) -> Optional[str]:
 # -------------------- Session state --------------------
 if "token" not in st.session_state: st.session_state.token = None
 if "account_id" not in st.session_state: st.session_state.account_id = ACCOUNT_ID
-if "dialog" not in st.session_state: st.session_state.dialog = []  # LLM context
-if "messages" not in st.session_state: st.session_state.messages = []  # UI chat history
-if "pending_order" not in st.session_state: st.session_state.pending_order = None  # {'order_id','body','summary','symbol'}
-if "gather_mode" not in st.session_state: st.session_state.gather_mode = None       # which field are we asking for explicitly
+if "dialog" not in st.session_state: st.session_state.dialog = []  # LLM history
+if "messages" not in st.session_state: st.session_state.messages = []  # chat UI
+if "pending_order" not in st.session_state: st.session_state.pending_order = None  # {'order_id','body','intent'}
+if "pending_intent" not in st.session_state: st.session_state.pending_intent = None  # dict being filled incrementally
+if "gather_mode" not in st.session_state: st.session_state.gather_mode = None       # which field we’re asking for
+if "last_status" not in st.session_state: st.session_state.last_status = None
 
-# -------------------- Auth helpers (silent; we do not display IDs) --------------------
+# -------------------- Auth (silent) --------------------
 def ensure_auth() -> Optional[str]:
     if st.session_state.token:
         return st.session_state.token
     if not PUBLIC_API_SECRET:
-        with st.chat_message("assistant"):
-            st.error("Missing trading API secret in Streamlit secrets.")
+        say("Missing trading API secret in Streamlit secrets.")
         return None
     try:
         st.session_state.token = get_access_token(PUBLIC_API_SECRET)
         return st.session_state.token
-    except requests.HTTPError as e:
-        with st.chat_message("assistant"):
-            st.error(f"Authentication failed.")
+    except requests.HTTPError:
+        say("Authentication failed.")
         return None
 
 def ensure_account_id() -> Optional[str]:
@@ -201,16 +207,10 @@ def ensure_account_id() -> Optional[str]:
         st.session_state.account_id = get_brokerage_account_id(token)
         return st.session_state.account_id
     except Exception:
-        with st.chat_message("assistant"):
-            st.error("Could not resolve brokerage account.")
+        say("Could not resolve brokerage account.")
         return None
 
-# -------------------- Chat history rendering --------------------
-for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
-
-# -------------------- Helpers --------------------
+# -------------------- Chat rendering helpers --------------------
 def say(text: str):
     st.session_state.messages.append({"role":"assistant","content":text})
     with st.chat_message("assistant"):
@@ -221,86 +221,245 @@ def you(text: str):
     with st.chat_message("user"):
         st.markdown(text)
 
-def is_confirm(msg: str) -> bool:
-    return bool(re.fullmatch(r"\s*(confirm|yes|y|place|ok)\s*", msg.lower()))
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
 
-def is_cancel(msg: str) -> bool:
-    return bool(re.fullmatch(r"\s*(cancel|no|n|stop|abort)\s*", msg.lower()))
+# -------------------- Parsing helpers for gather_mode answers --------------------
+def normalize_side(s: str) -> Optional[str]:
+    s = s.strip().lower()
+    if s in {"buy","b"}: return "BUY"
+    if s in {"sell","s"}: return "SELL"
+    return None
 
-def first_missing(missing: List[str]) -> Optional[str]:
-    return missing[0] if missing else None
+def normalize_ordertype(s: str) -> Optional[str]:
+    s = s.strip().lower()
+    if s in {"m","market"}: return "MARKET"
+    if s in {"l","limit"}: return "LIMIT"
+    if s in {"stop"}: return "STOP"
+    if s in {"stop limit","stop_limit","sl","stoplimit"}: return "STOP_LIMIT"
+    return None
+
+def normalize_tif(s: str) -> Optional[str]:
+    s = s.strip().lower()
+    if s == "day": return "DAY"
+    if s == "gtc": return "GTC"
+    return None
+
+def try_float(s: str) -> Optional[float]:
+    try:
+        return float(s.replace("$","").replace(",","").strip())
+    except Exception:
+        return None
+
+def try_int(s: str) -> Optional[int]:
+    try:
+        return int(s.replace(",","").strip())
+    except Exception:
+        return None
+
+def next_missing(intent: dict) -> Optional[str]:
+    # required: symbol, side, orderType, tif, and either quantity or amount
+    # plus price fields depending on orderType
+    if not intent.get("symbol"): return "symbol"
+    if not intent.get("side"): return "side"
+    if not intent.get("orderType"): return "orderType"
+    otype = intent.get("orderType")
+    if otype in {"LIMIT","STOP_LIMIT"} and intent.get("limitPrice") is None: return "limitPrice"
+    if otype in {"STOP","STOP_LIMIT"} and intent.get("stopPrice")  is None: return "stopPrice"
+    if intent.get("quantity") is None and intent.get("amount") is None: return "quantity"
+    if not intent.get("tif"): return "tif"
+    return None
+
+def prompt_for(field: str) -> str:
+    prompts = {
+        "symbol": "Which ticker do you want to trade?",
+        "side": "Buy or Sell?",
+        "orderType": "What order type: Market, Limit, Stop, or Stop Limit?",
+        "limitPrice": "What limit price?",
+        "stopPrice": "What stop price?",
+        "quantity": "How many shares (or say a dollar amount instead)?",
+        "tif": "Time in force: DAY or GTC?",
+    }
+    return prompts.get(field, "Please provide the missing detail.")
 
 def build_order_body(sym: str, intent: dict) -> dict:
-    side = intent.get("side")
-    otype = intent.get("orderType")
-    qty   = intent.get("quantity")
-    amt   = intent.get("amount")
-    lpx   = intent.get("limitPrice")
-    spx   = intent.get("stopPrice")
-    tif   = intent.get("tif")  # DO NOT default; we will ask for it if missing
     body = {
         "orderId": str(uuid.uuid4()),
         "instrument": {"symbol": sym, "type": "EQUITY"},
-        "orderSide": side,
-        "orderType": otype,
-        "expiration": {"timeInForce": tif} if tif else {"timeInForce": None},
+        "orderSide": intent["side"],
+        "orderType": intent["orderType"],
+        "expiration": {"timeInForce": intent["tif"]},
     }
-    if qty is not None: body["quantity"] = str(qty)
-    if amt is not None: body["amount"] = str(amt)
-    if lpx is not None: body["limitPrice"] = str(lpx)
-    if spx is not None: body["stopPrice"] = str(spx)
+    if intent.get("quantity") is not None: body["quantity"] = str(intent["quantity"])
+    if intent.get("amount")   is not None: body["amount"]   = str(intent["amount"])
+    if intent.get("limitPrice") is not None: body["limitPrice"] = str(intent["limitPrice"])
+    if intent.get("stopPrice")  is not None: body["stopPrice"]  = str(intent["stopPrice"])
     return body
 
-# -------------------- Main chat input --------------------
-user_text = st.chat_input("Type here (e.g., 'buy 1 share of NVDA at 120 limit, GTC')")
+def summarize(sym: str, intent: dict) -> str:
+    side = intent.get("side")
+    qty  = intent.get("quantity")
+    amt  = intent.get("amount")
+    otype = intent.get("orderType")
+    tif  = intent.get("tif")
+    lpx  = intent.get("limitPrice")
+    spx  = intent.get("stopPrice")
+    parts = [side]
+    parts.append(f"{qty} share(s)" if qty is not None else f"${amt}")
+    parts.append(f"of {sym}")
+    parts.append(f"as {otype}")
+    if lpx is not None: parts.append(f"@ {lpx}")
+    if spx is not None: parts.append(f"stop {spx}")
+    parts.append(f"({tif})")
+    return " ".join(parts)
 
+# -------------------- Main Chat Input --------------------
+placeholder = "Check quotes or place orders (e.g., 'quote NVDA', 'buy 1 AAPL limit 190 GTC')"
+user_text = st.chat_input(placeholder)
+
+# Quick commands
+def is_confirm(msg: str) -> bool:
+    return bool(re.fullmatch(r"\s*(confirm|yes|y|place|ok)\s*", msg.lower()))
+def is_cancel(msg: str) -> bool:
+    return bool(re.fullmatch(r"\s*(cancel|no|n|stop|abort)\s*", msg.lower()))
+
+# -------------------- Process input --------------------
 if user_text:
     user_text = user_text.strip()
     you(user_text)
 
-    # Handle pending order confirmations first
+    token = st.session_state.token or (get_access_token(PUBLIC_API_SECRET) if PUBLIC_API_SECRET else None)
+    st.session_state.token = token
+    if token and not st.session_state.account_id:
+        try:
+            st.session_state.account_id = ACCOUNT_ID or get_brokerage_account_id(token)
+        except Exception:
+            say("Could not resolve brokerage account.")
+            st.stop()
+
+    # 1) If awaiting confirmation of a ready order
     if st.session_state.pending_order and (is_confirm(user_text) or is_cancel(user_text)):
         if is_cancel(user_text):
             st.session_state.pending_order = None
+            st.session_state.pending_intent = None
             st.session_state.gather_mode = None
             say("Cancelled. No order was placed.")
             st.stop()
         else:
             po = st.session_state.pending_order
-            token = ensure_auth(); account_id = ensure_account_id()
-            if token and account_id:
-                try:
-                    place_order(token, account_id, po["body"])
-                    say(f"Order submitted: **{po['body']['orderId']}**. Checking status…")
-                    # brief tracking
-                    status = None
-                    for _ in range(12):
-                        s = get_order(token, account_id, po["body"]["orderId"])
-                        if s:
-                            status = s
-                            status_text = s.get("status", "UNKNOWN")
-                            rej = s.get("rejectReason")
-                            if rej: status_text += f" — {rej}"
+            try:
+                place_order(st.session_state.token, st.session_state.account_id, po["body"])
+                say(f"Order submitted: **{po['body']['orderId']}**. Checking status…")
+                # Only show status when it changes
+                st.session_state.last_status = None
+                for _ in range(12):
+                    s = get_order(st.session_state.token, st.session_state.account_id, po["body"]["orderId"])
+                    if s:
+                        status_text = s.get("status","UNKNOWN")
+                        if status_text != st.session_state.last_status:
+                            st.session_state.last_status = status_text
                             say(f"Status: **{status_text}**")
-                            if s.get("status") in {"FILLED","REJECTED","CANCELLED","EXPIRED","REPLACED"}:
-                                break
-                        time.sleep(1.2)
-                    if not status:
-                        say("Order submitted. Current status isn’t available yet.")
-                except requests.HTTPError:
-                    say("Order placement failed.")
-            st.session_state.pending_order = None
-            st.session_state.gather_mode = None
+                        if status_text in {"FILLED","REJECTED","CANCELLED","EXPIRED","REPLACED"}:
+                            break
+                    time.sleep(1.2)
+                if st.session_state.last_status is None:
+                    say("Order submitted. Current status isn’t available yet.")
+            except requests.HTTPError:
+                say("Order placement failed.")
+            finally:
+                st.session_state.pending_order = None
+                st.session_state.pending_intent = None
+                st.session_state.gather_mode = None
         st.stop()
 
-    # Normal processing
-    token = ensure_auth(); account_id = ensure_account_id()
-    if not (token and account_id):
+    # 2) If we are in gather_mode, capture this answer directly (no LLM re-ask)
+    if st.session_state.gather_mode and st.session_state.pending_intent is not None:
+        field = st.session_state.gather_mode
+        val = user_text
+
+        if field == "symbol":
+            sym = resolve_symbol(st.session_state.token, val)
+            if not sym:
+                say("I couldn’t resolve that ticker—try the exact symbol (e.g., NVDA).")
+                st.stop()
+            st.session_state.pending_intent["symbol"] = sym
+
+        elif field == "side":
+            side = normalize_side(val)
+            if not side:
+                say("Please reply with **Buy** or **Sell**.")
+                st.stop()
+            st.session_state.pending_intent["side"] = side
+
+        elif field == "orderType":
+            ot = normalize_ordertype(val)
+            if not ot:
+                say("Please reply with one of: **Market, Limit, Stop, Stop Limit**.")
+                st.stop()
+            st.session_state.pending_intent["orderType"] = ot
+
+        elif field == "limitPrice":
+            f = try_float(val)
+            if f is None:
+                say("Please reply with a valid limit price (number).")
+                st.stop()
+            st.session_state.pending_intent["limitPrice"] = f
+
+        elif field == "stopPrice":
+            f = try_float(val)
+            if f is None:
+                say("Please reply with a valid stop price (number).")
+                st.stop()
+            st.session_state.pending_intent["stopPrice"] = f
+
+        elif field == "quantity":
+            # Accept either shares or dollar amount like "$500"
+            if re.search(r"^\s*\$", val):
+                amt = try_float(val)
+                if amt is None:
+                    say("Please reply with a number like $500 or a share count like 5.")
+                    st.stop()
+                st.session_state.pending_intent["amount"] = amt
+                st.session_state.pending_intent.pop("quantity", None)
+            else:
+                qty = try_int(val)
+                if qty is None:
+                    say("Please reply with a whole number of shares (e.g., 1, 10) or $amount.")
+                    st.stop()
+                st.session_state.pending_intent["quantity"] = qty
+                st.session_state.pending_intent.pop("amount", None)
+
+        elif field == "tif":
+            t = normalize_tif(val)
+            if not t:
+                say("Please reply with **DAY** or **GTC**.")
+                st.stop()
+            st.session_state.pending_intent["tif"] = t
+
+        # See what’s still missing
+        need = next_missing(st.session_state.pending_intent)
+        if need:
+            st.session_state.gather_mode = need
+            say(prompt_for(need))
+            st.stop()
+        else:
+            # Build & confirm
+            sym = st.session_state.pending_intent["symbol"]
+            body = build_order_body(sym, st.session_state.pending_intent)
+            st.session_state.pending_order = {"body": body}
+            say("Please review: " + summarize(sym, st.session_state.pending_intent))
+            say("Type **confirm** to place this order, or **cancel** to abort.")
+            st.stop()
+
+    # 3) Otherwise, interpret this new message from scratch
+    # Ensure auth first
+    if not (st.session_state.token and st.session_state.account_id):
+        say("Missing credentials. Check secrets.")
         st.stop()
 
-    # Keep LLM dialog context like original
+    # Try to interpret with LLM once
     st.session_state.dialog.append({"role":"user","content":user_text})
-
     try:
         parsed = llm_interpret(st.session_state.dialog)
     except Exception:
@@ -309,100 +468,47 @@ if user_text:
 
     ptype = parsed.get("type")
     intent = parsed.get("intent") or {}
-    missing = parsed.get("missing") or []
 
     if ptype == "QUOTE":
-        # Pull the target symbol/company and show a concise quote
         qstr = llm_extract_target(st.session_state.dialog) or user_text
-        sym = resolve_symbol(token, qstr)
+        sym = resolve_symbol(st.session_state.token, qstr)
         if not sym:
             say(f"I couldn’t find a tradable symbol for “{qstr}”. What ticker did you mean?")
         else:
             try:
-                quote = get_equity_quote(token, account_id, sym)
+                quote = get_equity_quote(st.session_state.token, st.session_state.account_id, sym)
                 if not quote:
                     say(f"No quote returned for **{sym}**.")
                 else:
                     last = quote.get("last") or quote.get("lastPrice") or quote.get("price") or quote.get("closePrice")
                     bid, ask = quote.get("bid"), quote.get("ask")
                     vol = quote.get("volume")
-                    say(llm_phrase(f"{sym} is around {last}. Bid {bid}, ask {ask}. Volume {vol}."))
-            except Exception as e:
-                say(f"Quote lookup failed.")
+                    # Keep it one line and clean; avoid funky formatting
+                    say(f"**{sym}** ≈ {last}. Bid {bid}, ask {ask}. Volume {vol}.")
+            except Exception:
+                say("Quote lookup failed.")
         st.stop()
 
-    if ptype == "ASK" or missing:
-        # Don’t assume anything. Ask for the next most important missing field.
-        need = first_missing(missing)
-        # Prefer to gather in a sensible order
-        priority = ["symbol", "side", "orderType", "quantity", "amount", "limitPrice", "stopPrice", "tif"]
-        need = next((f for f in priority if f in missing), need)
-
-        prompts = {
-            "symbol": "Which ticker or company do you want to trade?",
-            "side": "Buy or Sell?",
-            "orderType": "What order type: Market, Limit, Stop, or Stop Limit?",
-            "quantity": "How many shares?",
-            "amount": "Alternatively, what dollar amount?",
-            "limitPrice": "What limit price?",
-            "stopPrice": "What stop price?",
-            "tif": "Time in force: DAY or GTC?",
-        }
-        # If user said “buy 1 stock”, do not guess. Ask for ticker first, then orderType, then TIF, etc.
-        say(prompts.get(need, parsed.get("question") or "Can you share the missing details?"))
+    if ptype == "ASK":
+        # Seed pending_intent with what the LLM already parsed, then start gathering
+        st.session_state.pending_intent = intent
+        need = next_missing(st.session_state.pending_intent)
         st.session_state.gather_mode = need
+        say(prompt_for(need))
         st.stop()
 
-    # If we’re here, we have enough to build an order — but STILL don’t assume defaults.
-    symbol_input = intent.get("symbol")
-    sym = resolve_symbol(token, symbol_input) if symbol_input else None
-    if not sym:
-        say("Which ticker do you want to trade?")
-        st.session_state.gather_mode = "symbol"
-        st.stop()
-
-    # Check TIF; if missing, ask.
-    if not intent.get("tif"):
-        say("Time in force for this order: **DAY** or **GTC**?")
-        st.session_state.gather_mode = "tif"
-        st.stop()
-
-    # If order type demands prices, ensure they’re present.
-    otype = intent.get("orderType")
-    if otype in {"LIMIT", "STOP_LIMIT"} and intent.get("limitPrice") is None:
-        say("What **limit price** do you want?")
-        st.session_state.gather_mode = "limitPrice"
-        st.stop()
-    if otype in {"STOP", "STOP_LIMIT"} and intent.get("stopPrice") is None:
-        say("What **stop price** do you want?")
-        st.session_state.gather_mode = "stopPrice"
-        st.stop()
-
-    # Need either quantity or amount
-    if intent.get("quantity") is None and intent.get("amount") is None:
-        say("How many shares, or what dollar amount?")
-        st.session_state.gather_mode = "quantity"  # we’ll accept either in next turn
-        st.stop()
-
-    # Build body WITHOUT assuming defaults (tif is guaranteed above)
-    body = build_order_body(sym, intent)
-
-    # Human summary
-    side = intent.get("side")
-    qty  = intent.get("quantity")
-    amt  = intent.get("amount")
-    tif  = intent.get("tif")
-    lpx  = intent.get("limitPrice")
-    spx  = intent.get("stopPrice")
-    summary_parts = [f"{side}"]
-    summary_parts.append(f"{qty} share(s)" if qty is not None else f"${amt}")
-    summary_parts.append(f"of {sym}")
-    summary_parts.append(f"as {otype}")
-    if lpx is not None: summary_parts.append(f"@ {lpx}")
-    if spx is not None: summary_parts.append(f"stop {spx}")
-    summary_parts.append(f"({tif})")
-    human_summary = " ".join(summary_parts)
-
-    say("Please review: " + llm_phrase(human_summary))
-    st.session_state.pending_order = {"body": body}
-    say("Type **confirm** to place this order, or **cancel** to abort.")
+    if ptype == "ORDER":
+        # If anything is missing, enter gather mode
+        st.session_state.pending_intent = intent
+        need = next_missing(st.session_state.pending_intent)
+        if need:
+            st.session_state.gather_mode = need
+            say(prompt_for(need))
+            st.stop()
+        else:
+            sym = st.session_state.pending_intent["symbol"]
+            body = build_order_body(sym, st.session_state.pending_intent)
+            st.session_state.pending_order = {"body": body}
+            say("Please review: " + summarize(sym, st.session_state.pending_intent))
+            say("Type **confirm** to place this order, or **cancel** to abort.")
+            st.stop()
